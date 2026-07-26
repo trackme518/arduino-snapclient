@@ -34,24 +34,34 @@ class SnapProcessorRTOS : public SnapProcessor {
     // regular begin logic
     bool result = SnapProcessor::begin();
     // allocate buffer, so that we could use psram
-    size_queue.resize(RTOS_MAX_QUEUE_ENTRY_COUNT);
-    size_queue.setWriteMaxWait(5);
+    chunk_queue.resize(RTOS_MAX_QUEUE_ENTRY_COUNT);
+    chunk_queue.setReadMaxWait(0);
+    chunk_queue.setWriteMaxWait(5);
     buffer.resize(buffer_size);
+    buffer.setReadMaxWait(0);
+    buffer.setWriteMaxWait(5);
+    p_snap_output->setRealtimeOutputDelayLimitEnabled(false);
+    task_started = false;
     return result;
   }
 
   void end(void) override {
     task.suspend();
     task_started = false;
-    size_queue.clear();
+    chunk_queue.clear();
     buffer.reset();
     SnapProcessor::end();
   }
 
  protected:
+  struct QueuedChunk {
+    SnapAudioHeader header;
+    size_t size = 0;
+  };
+
   const char *TAG = "SnapProcessorRTOS";
-  audio_tools::Task task{"output", RTOS_STACK_SIZE, RTOS_TASK_PRIORITY, 1};
-  audio_tools::QueueRTOS<size_t> size_queue{0};
+  audio_tools::Task task{"output", RTOS_STACK_SIZE, RTOS_TASK_PRIORITY, -1};
+  audio_tools::QueueRTOS<QueuedChunk> chunk_queue{0};
   audio_tools::BufferRTOS<uint8_t> buffer{0}; // size defined in constructor
   bool task_started = false;
   int active_percent;
@@ -73,29 +83,41 @@ class SnapProcessorRTOS : public SnapProcessor {
       stop();
     }
     
-    ESP_LOGI(TAG, "size: %zu / buffer %d", size, buffer.available());
+    ESP_LOGD(TAG, "size: %zu / buffer %d", size, buffer.available());
     if (!p_snap_output->isStarted() || size == 0) {
       ESP_LOGW(TAG, "not started");
       return 0;
     }
 
-    if (!p_snap_output->synchronizePlayback()) {
-      return size;
-    }
+    p_snap_output->markAudioActivity();
 
-    if (!size_queue.enqueue(size)) {
-      ESP_LOGW(TAG, "size_queue full");
+    if (buffer.availableForWrite() < static_cast<int>(size)) {
+      ESP_LOGW(TAG, "encoded buffer full: need %zu, free %d", size,
+               buffer.availableForWrite());
       return 0;
     }
 
     size_t size_written = buffer.writeArray(data, size);
     if (size_written != size) {
       ESP_LOGE(TAG, "buffer-overflow");
+      buffer.reset();
+      chunk_queue.clear();
+      return 0;
+    }
+
+    QueuedChunk chunk;
+    chunk.header = current_audio_header;
+    chunk.size = size;
+    if (!chunk_queue.enqueue(chunk)) {
+      ESP_LOGW(TAG, "chunk_queue full");
+      buffer.reset();
+      chunk_queue.clear();
+      return 0;
     }
 
     ESP_LOGD(TAG, "buffer %d - %d vs limit %d", size, buffer.available(),
              bufferTaskActivationLimit());
-    if (!task_started && buffer.available() > bufferTaskActivationLimit()) {
+    if (!task_started && buffer.available() >= bufferTaskActivationLimit()) {
       ESP_LOGI(TAG, "===> starting output task");
       task_started = true;
       task.begin(task_copy);
@@ -111,17 +133,62 @@ class SnapProcessorRTOS : public SnapProcessor {
 
   /// Copy the buffered data to the output
   void copy() {
-    size_t size = 0;
-    if (size_queue.dequeue(size)) {
-      uint8_t data[size];
-      int read = buffer.readArray(data, size);
-      assert(read == size);
-      int written = p_snap_output->audioWrite(data, size);
-      if (written != size) {
-        ESP_LOGW(TAG, "write %d of %d", written, size);
+    QueuedChunk chunk;
+    if (!chunk_queue.peek(chunk)) {
+      delay(1);
+      return;
+    }
+
+    if (p_snap_output->isHeaderTooLate(chunk.header, false)) {
+      if (chunk_queue.dequeue(chunk)) {
+        discardPayload(chunk.size);
+        ESP_LOGW(TAG, "dropped late chunk: %zu bytes", chunk.size);
       }
+      delay(1);
+      return;
+    }
+
+    if (!p_snap_output->isHeaderReadyForPlayback(chunk.header, false)) {
+      delay(1);
+      return;
+    }
+
+    if (!chunk_queue.dequeue(chunk)) {
+      delay(1);
+      return;
+    }
+
+    uint8_t data[chunk.size];
+    int read = buffer.readArray(data, chunk.size);
+    if (read != static_cast<int>(chunk.size)) {
+      ESP_LOGE(TAG, "readArray failed %d -> %d", static_cast<int>(chunk.size),
+               read);
+      buffer.reset();
+      chunk_queue.clear();
+      delay(1);
+      return;
+    }
+
+    p_snap_output->writeHeader(chunk.header);
+    int written = p_snap_output->write(data, chunk.size);
+    if (written != static_cast<int>(chunk.size)) {
+      ESP_LOGW(TAG, "write %d of %d", written, static_cast<int>(chunk.size));
     }
     delay(1);
+  }
+
+  void discardPayload(size_t size) {
+    uint8_t discard[256];
+    while (size > 0) {
+      size_t to_read = size > sizeof(discard) ? sizeof(discard) : size;
+      int read = buffer.readArray(discard, to_read);
+      if (read <= 0) {
+        buffer.reset();
+        chunk_queue.clear();
+        return;
+      }
+      size -= static_cast<size_t>(read);
+    }
   }
 
   /// static method for rtos task: make sure we constantly output audio

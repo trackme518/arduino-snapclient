@@ -2,6 +2,9 @@
 #include "AudioTools.h"
 #include "SnapLogger.h"
 #include "SnapTime.h"
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace snap_arduino {
 
@@ -22,12 +25,15 @@ public:
   }
 
   /// Starts the processing
-  void begin(int rate) {
+  virtual void begin(int rate) {
+    (void)rate;
     update_count = 0;
+    active = false;
   }
 
-  /// Records the actual server time in millisecondes
-  virtual void updateServerTime(uint32_t serverMillis) = 0;
+  /// Records one sync measurement using explicit client monotonic and server timestamps.
+  virtual void updateSyncMeasurement(uint32_t clientMonotonicMs,
+                                     uint32_t serverMillis) = 0;
 
   /// Records the actual playback delay (currently not used)
   virtual void updateActualDelay(int delay) {}
@@ -57,12 +63,12 @@ public:
   /// every 10 updates.
   void setInterval(int interval) { this->interval = interval; }
 
-  /// Provides the effective delay to be used (Message buffer lag -
-  /// decoding/playback time)
+  /// Provides the effective delay to be used (message buffer lag -
+  /// decoder/playback latency).
   int getStartDelay() {
-    int delay = std::max(0, message_buffer_delay_ms + processing_lag);
-    if (message_buffer_delay_ms + processing_lag < 0){
-      LOGE("The processing lag can not be smaller then -%d", message_buffer_delay_ms);
+    int delay = std::max(0, message_buffer_delay_ms - processing_lag);
+    if (message_buffer_delay_ms - processing_lag < 0){
+      LOGE("The processing lag can not be bigger then %d", message_buffer_delay_ms);
     }
     ESP_LOGD(TAG, "delay: %d", delay);
     return delay;
@@ -76,7 +82,7 @@ protected:
   bool active = false;
   // start delay
   int processing_lag = 0;
-  uint16_t message_buffer_delay_ms = 0;
+  int message_buffer_delay_ms = 0;
 
 };
 
@@ -94,32 +100,151 @@ public:
                       int interval = 10)
       : SnapTimeSync(processingLag, interval) {}
 
-  void updateServerTime(uint32_t serverMillis) override {
-    update_count++;
-    active = true;
-    SnapTimePoints tp{serverMillis};
-    if (time_points.size()>=interval){
-      time_points.pop_front();
-    }
-    time_points.push_back(tp);
+  void begin(int rate) override {
+    SnapTimeSync::begin(rate);
+    raw_offsets.clear();
+    offset_points.clear();
+    playback_errors.clear();
+    smoothed_factor = 1.0f;
+    clock_factor = 1.0f;
+    playback_factor = 1.0f;
   }
 
-  float getFactor() {
-    int last_idx = time_points.size()-1;
-    if (last_idx <=1) return 1.0;
-    float timespan_local_ms = time_points[last_idx].local_ms - time_points[0].local_ms;
-    float timespan_server_ms = time_points[last_idx].server_ms - time_points[0].server_ms;
-    if (timespan_local_ms == 0.0 || timespan_server_ms == 0.0) {
-      ESP_LOGE(TAG, "Could not determine clock differences");
-      return 1.0;
+  void updateSyncMeasurement(uint32_t clientMonotonicMs,
+                             uint32_t serverMillis) override {
+    update_count++;
+    active = true;
+
+    int32_t raw_offset = static_cast<int32_t>(clientMonotonicMs - serverMillis);
+    if (raw_offsets.size() >= ppm_samples_window) {
+      raw_offsets.pop_front();
     }
-    // if server time span is smaller then local, local runs faster and needs to be slowed down
-    float result_factor = timespan_server_ms / timespan_local_ms;    
-    ESP_LOGI(TAG, "=> adjusting playback speed by factor: %f", result_factor);
-    return result_factor;
+    raw_offsets.push_back(raw_offset);
+
+    int32_t filtered_offset = median(raw_offsets);
+
+    if (offset_points.size() >= ppm_samples_window) {
+      offset_points.pop_front();
+    }
+    offset_points.push_back(OffsetPoint{clientMonotonicMs, filtered_offset});
+
+    recomputeFactor();
   }
+
+  void updateActualDelay(int delay) override {
+    if (playback_errors.size() >= playback_error_window) {
+      playback_errors.pop_front();
+    }
+    playback_errors.push_back(delay);
+    recomputeFactor();
+  }
+
+  float getFactor() override { return smoothed_factor; }
+
+  void set_ppm_threshold(float ppm) {
+    ppm_threshold = std::max(0.0f, ppm);
+  }
+
+  void set_ppm_max_correction(float ppm) {
+    ppm_max_correction = std::max(1.0f, ppm);
+  }
+
+  void set_ppm_samples(size_t samples) {
+    ppm_samples_window = std::max(min_valid_measurements, samples);
+    while (raw_offsets.size() > ppm_samples_window) {
+      raw_offsets.pop_front();
+    }
+    while (offset_points.size() > ppm_samples_window) {
+      offset_points.pop_front();
+    }
+  }
+
+  void set_ppm_smoothing(float alpha) {
+    if (alpha < 0.0f) {
+      alpha = 0.0f;
+    }
+    if (alpha > 1.0f) {
+      alpha = 1.0f;
+    }
+    ppm_smoothing_alpha = alpha;
+  }
+
 protected:
-  Vector<SnapTimePoints> time_points;
+  struct OffsetPoint {
+    uint32_t local_ms;
+    int32_t filtered_offset_ms;
+  };
+
+  static constexpr size_t min_valid_measurements = 20;
+
+  float ppm_threshold = 50.0f;
+  float ppm_max_correction = 1000.0f;
+  size_t ppm_samples_window = 20;
+  float ppm_smoothing_alpha = 0.05f;
+  float smoothed_factor = 1.0f;
+  float clock_factor = 1.0f;
+  float playback_factor = 1.0f;
+
+  Vector<int32_t> raw_offsets;
+  Vector<OffsetPoint> offset_points;
+  Vector<int32_t> playback_errors;
+  size_t playback_error_window = 20;
+
+  int32_t median(Vector<int32_t> &values) {
+    std::vector<int32_t> sorted;
+    sorted.reserve(values.size());
+    for (size_t i = 0; i < values.size(); i++) {
+      sorted.push_back(values[i]);
+    }
+    std::sort(sorted.begin(), sorted.end());
+    size_t mid = sorted.size() / 2;
+    if (sorted.size() % 2 == 0) {
+      return static_cast<int32_t>((static_cast<int64_t>(sorted[mid - 1]) +
+                                   static_cast<int64_t>(sorted[mid])) /
+                                  2);
+    }
+    return sorted[mid];
+  }
+
+  void recomputeFactor() {
+    if (offset_points.size() >= min_valid_measurements &&
+        raw_offsets.size() >= min_valid_measurements) {
+      const OffsetPoint &oldest = offset_points[0];
+      const OffsetPoint &newest = offset_points[offset_points.size() - 1];
+      int32_t delta_local = static_cast<int32_t>(newest.local_ms - oldest.local_ms);
+      if (delta_local > 0) {
+        int32_t delta_offset = newest.filtered_offset_ms - oldest.filtered_offset_ms;
+        float slope = static_cast<float>(delta_offset) / static_cast<float>(delta_local);
+        float drift_ppm = slope * 1000000.0f;
+
+        if (std::fabs(drift_ppm) < ppm_threshold) {
+          drift_ppm = 0.0f;
+        }
+
+        if (drift_ppm > ppm_max_correction) {
+          drift_ppm = ppm_max_correction;
+        } else if (drift_ppm < -ppm_max_correction) {
+          drift_ppm = -ppm_max_correction;
+        }
+
+        clock_factor = 1.0f - (drift_ppm / 1000000.0f);
+      }
+    }
+
+    if (playback_errors.size() >= min_valid_measurements) {
+      int32_t error_ms = median(playback_errors);
+      float playback_ppm = static_cast<float>(error_ms) * 50.0f;
+      if (playback_ppm > ppm_max_correction) {
+        playback_ppm = ppm_max_correction;
+      } else if (playback_ppm < -ppm_max_correction) {
+        playback_ppm = -ppm_max_correction;
+      }
+      playback_factor = 1.0f + (playback_ppm / 1000000.0f);
+    }
+
+    float target_factor = clock_factor * playback_factor;
+    smoothed_factor += ppm_smoothing_alpha * (target_factor - smoothed_factor);
+  }
 };
 
 /**
@@ -136,16 +261,31 @@ public:
                       int interval = 10)
       : SnapTimeSync(processingLag, interval) {}
 
-  void updateServerTime(uint32_t serverMillis) override {
+  void begin(int rate) override {
+    SnapTimeSync::begin(rate);
+    start_time.local_ms = 0;
+    start_time.server_ms = 0;
+    current_time.local_ms = 0;
+    current_time.server_ms = 0;
+  }
+
+  void updateSyncMeasurement(uint32_t clientMonotonicMs,
+                             uint32_t serverMillis) override {
     if (update_count == 0){
-      start_time = SnapTimePoints(serverMillis);
+      start_time.local_ms = clientMonotonicMs;
+      start_time.server_ms = serverMillis;
     }
-    current_time = SnapTimePoints(serverMillis);
+    current_time.local_ms = clientMonotonicMs;
+    current_time.server_ms = serverMillis;
     update_count++;
     active = true;
   }
 
   float getFactor() {
+    if (update_count < 20) {
+      return 1.0;
+    }
+
     float timespan_local_ms = current_time.local_ms - start_time.local_ms;
     float timespan_server_ms = current_time.server_ms - start_time.server_ms;
     if (timespan_local_ms == 0.0 || timespan_server_ms == 0.0) {
@@ -154,7 +294,6 @@ public:
     }
     // if server time span is smaller then local, local runs faster and needs to be slowed down
     float result_factor = timespan_server_ms / timespan_local_ms;    
-    ESP_LOGI(TAG, "=> adjusting playback speed by factor: %f", result_factor);
     return result_factor;
   }
 protected:
@@ -178,7 +317,11 @@ public:
     resample_factor = factor;
   }
 
-  void updateServerTime(uint32_t serverMillis) override {}
+  void updateSyncMeasurement(uint32_t clientMonotonicMs,
+                             uint32_t serverMillis) override {
+    (void)clientMonotonicMs;
+    (void)serverMillis;
+  }
 
   float getFactor() { return resample_factor; }
 

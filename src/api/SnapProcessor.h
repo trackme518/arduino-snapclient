@@ -7,6 +7,7 @@
 #include "SnapProcessor.h"
 #include "SnapProtocol.h"
 #include "SnapTime.h"
+#include <algorithm>
 #include "vector"
 
 namespace snap_arduino {
@@ -151,12 +152,14 @@ protected:
   SnapMessageBase base_message;
   SnapMessageTime time_message;
   SnapMessageServerSettings server_settings_message;
+  SnapAudioHeader current_audio_header;
   uint32_t client_state_muted = 0;
   char *start = nullptr;
   int size = 0;
   timeval now;
   uint64_t last_time_sync = 0;
   int id_counter = 0;
+  uint32_t base_message_received_mono_ms = 0;
   IPAddress server_ip;
   int server_port = CONFIG_SNAPCAST_SERVER_PORT;
   const char *mac_address = "00-00-00-00-00";
@@ -170,6 +173,10 @@ protected:
   loop_status_enum loop_status = LoopStart;
   const char* hostname = CONFIG_SNAPCAST_CLIENT_NAME;
   const char* client_name = "libsnapcast";
+  static constexpr uint32_t payload_read_timeout_ms = 2000;
+  static constexpr uint32_t server_settings_size_prefix_len = 4;
+  static constexpr uint32_t opus_header_min_size = 12;
+  static constexpr uint32_t wav_header_size = 44;
 
   bool processLoopStepFast() {
     switch (loop_status) {
@@ -275,7 +282,9 @@ protected:
 
     switch (base_message.type) {
     case SNAPCAST_MESSAGE_CODEC_HEADER:
-      processMessageCodecHeader();
+      if (!processMessageCodecHeader()) {
+        return false;
+      }
       header_received = true;
       break;
 
@@ -284,15 +293,21 @@ protected:
       if (!header_received) {
         return true;
       }
-      processMessageWireChunk();
+      if (!processMessageWireChunk()) {
+        return false;
+      }
       break;
 
     case SNAPCAST_MESSAGE_SERVER_SETTINGS:
-      processMessageServerSettings();
+      if (!processMessageServerSettings()) {
+        return false;
+      }
       break;
 
     case SNAPCAST_MESSAGE_TIME:
-      processMessageTime();
+      if (!processMessageTime()) {
+        return false;
+      }
       break;
 
     default:
@@ -377,6 +392,7 @@ protected:
     ESP_LOGD(TAG, "Bytes read: %d", size);
 
     now = snap_time.time();
+    base_message_received_mono_ms = millis();
 
     int result = base_message.deserialize(&send_receive_buffer[0], size);
     if (result) {
@@ -397,9 +413,36 @@ protected:
       send_receive_buffer.resize(base_message.size);
     }
     start = &send_receive_buffer[0];
-    while (p_client->available() < base_message.size)
-      delay(10);
-    size = p_client->readBytes(&(send_receive_buffer[0]), base_message.size);
+    size = 0;
+    uint32_t last_progress_ms = millis();
+    while (size < base_message.size) {
+      int available = p_client->available();
+      if (available > 0) {
+        size_t remaining = base_message.size - size;
+        size_t to_read = std::min<size_t>(static_cast<size_t>(available),
+                                          remaining);
+        int read = p_client->read(
+            reinterpret_cast<uint8_t *>(&(send_receive_buffer[size])), to_read);
+        if (read > 0) {
+          size += read;
+          last_progress_ms = millis();
+          continue;
+        }
+      }
+
+      if (!p_client->connected()) {
+        ESP_LOGW(TAG, "Disconnected while reading payload: %d/%d", size,
+                 base_message.size);
+        return false;
+      }
+
+      if (millis() - last_progress_ms > payload_read_timeout_ms) {
+        ESP_LOGW(TAG, "Timed out reading payload: %d/%d", size,
+                 base_message.size);
+        return false;
+      }
+      delay(1);
+    }
     return true;
   }
 
@@ -443,6 +486,10 @@ protected:
 
   bool processMessageCodecHeaderOpus(codec_type codecType) {
     ESP_LOGD(TAG, "start");
+    if (size < opus_header_min_size) {
+      ESP_LOGW(TAG, "Invalid Opus codec header size: %d", size);
+      return false;
+    }
     uint32_t rate;
     memcpy(&rate, start + 4, sizeof(rate));
     uint16_t bits;
@@ -458,10 +505,14 @@ protected:
 
   bool processMessageCodecHeaderWav(codec_type codecType) {
     ESP_LOGD(TAG, "start");
+    if (size < wav_header_size) {
+      ESP_LOGW(TAG, "Invalid WAV codec header size: %d", size);
+      return false;
+    }
     codec_from_server = codecType;
     audioBegin();
     // send the wav header to the codec
-    p_snap_output->audioWrite((const uint8_t*)start, 44);
+    p_snap_output->audioWrite((const uint8_t*)start, wav_header_size);
     return true;
   }
 
@@ -507,6 +558,7 @@ protected:
     header.sec = wire_chunk_message.timestamp.sec;
     header.usec = wire_chunk_message.timestamp.usec;
     header.codec = codec_from_server;
+    current_audio_header = header;
     writeAudioInfo(header);
 
     size_t chunk_res;
@@ -520,12 +572,23 @@ protected:
 
   bool processMessageServerSettings() {
     ESP_LOGD(TAG, "start");
+    if (size < server_settings_size_prefix_len) {
+      ESP_LOGW(TAG, "Invalid server settings size: %d", size);
+      return false;
+    }
+    uint32_t json_size = 0;
+    memcpy(&json_size, start, sizeof(json_size));
+    if (json_size > static_cast<uint32_t>(size - server_settings_size_prefix_len)) {
+      ESP_LOGW(TAG, "Truncated server settings payload: %u/%d", json_size,
+               size - server_settings_size_prefix_len);
+      return false;
+    }
     // The first 4 bytes in the buffer are the size of the string.
     // We don't need this, so we'll shift the entire buffer over 4 bytes
     // and use the extra room to add a null character so we can pares
     // it.
     memmove(start, start + 4, size - 4);
-    start[size - 3] = '\0';
+    start[json_size] = '\0';
     int result = server_settings_message.deserialize(start);
     if (result) {
       ESP_LOGI(TAG, "Failed to read server settings: %d", result);
@@ -537,9 +600,11 @@ protected:
     ESP_LOGI(TAG, "Mute:           %s", server_settings_message.muted ? "true":"false");
     ESP_LOGI(TAG, "Setting volume: %d", server_settings_message.volume);
 
-    // define the start delay from the server settings
+    // Snapcast server latency is an offset to compensate this client, so it is
+    // subtracted from the shared stream buffer just like the reference client.
     p_snap_output->snapTimeSync().setMessageBufferDelay(
-        server_settings_message.buffer_ms + server_settings_message.latency);
+        std::max<int32_t>(0, server_settings_message.buffer_ms -
+                                 server_settings_message.latency));
 
     // set volume
     if (header_received) {
@@ -561,23 +626,26 @@ protected:
       return false;
     }
 
-    // // Calculate TClienctx.tdif : Trx-Tsend-Tnetdelay/2
-    struct timeval ttx, trx;
-    ttx.tv_sec = base_message.sent.sec;
-    ttx.tv_usec = base_message.sent.usec;
-    trx.tv_sec = base_message.received.sec;
-    trx.tv_usec = base_message.received.usec;
+    // Snapcast protocol: server sends c2s = server_recv - client_sent in the
+    // Time payload. The client computes s2c = client_recv - server_sent from
+    // the response base header. The client-to-server clock offset is:
+    // diffToServer = (c2s - s2c) / 2.
+    const int64_t c2s_us = toMicroseconds(time_message.latency);
+    const int64_t s2c_us = toMicroseconds(base_message.received) -
+                           toMicroseconds(base_message.sent);
+    const int64_t diff_to_server_us = (c2s_us - s2c_us) / 2;
+    const int64_t local_rx_us = toMicroseconds(base_message.received);
+    const int64_t server_at_rx_us = local_rx_us + diff_to_server_us;
+    const uint32_t server_observed_ms =
+        static_cast<uint32_t>(server_at_rx_us / 1000);
 
-    // for time management
-    snap_time.updateServerTime(trx);
-    // for synchronization
-    p_snap_output->snapTimeSync().updateServerTime(snap_time.toMillis(trx));
+    snap_time.updateServerTimeMs(server_observed_ms);
+    snap_time.setTimeDifferenceClientServerMs(clampToInt32(diff_to_server_us / 1000));
 
-    int64_t time_diff = snap_time.timeDifferenceMs(trx, ttx);
-    uint32_t time_diff_int = time_diff;
-    assert(time_diff_int == time_diff);
-    ESP_LOGD(TAG, "Time Difference to Server: %ld ms", time_diff);
-    snap_time.setTimeDifferenceClientServerMs(time_diff);
+    const uint32_t local_rx_mono_ms = base_message_received_mono_ms;
+    p_snap_output->snapTimeSync().updateSyncMeasurement(local_rx_mono_ms,
+                                                        server_observed_ms);
+
 
     return true;
   }
@@ -626,6 +694,34 @@ protected:
     p_client->write((const uint8_t *)&send_receive_buffer[0],
                     TIME_MESSAGE_SIZE);
     return true;
+  }
+
+  int32_t toMillisSafe(const tv_t &tv) const {
+    int64_t sec_ms = static_cast<int64_t>(tv.sec) * 1000;
+    int64_t usec_ms = static_cast<int64_t>(tv.usec) / 1000;
+    int64_t value = sec_ms + usec_ms;
+    if (value < INT32_MIN) {
+      value = INT32_MIN;
+    }
+    if (value > INT32_MAX) {
+      value = INT32_MAX;
+    }
+    return static_cast<int32_t>(value);
+  }
+
+  int64_t toMicroseconds(const tv_t &tv) const {
+    return (static_cast<int64_t>(tv.sec) * 1000000LL) +
+           static_cast<int64_t>(tv.usec);
+  }
+
+  int32_t clampToInt32(int64_t value) const {
+    if (value < INT32_MIN) {
+      return INT32_MIN;
+    }
+    if (value > INT32_MAX) {
+      return INT32_MAX;
+    }
+    return static_cast<int32_t>(value);
   }
 
   void setMute(bool flag) { p_snap_output->setMute(flag); }
